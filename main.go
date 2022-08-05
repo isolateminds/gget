@@ -111,7 +111,7 @@ func CreateContainer(ctx context.Context, client *client.Client) (containerID st
 			AttachStdout: true,
 			AttachStderr: true,
 			User:         "gget",
-			//The entrypoint here is actually the invocation of the git-dumper command
+			//The entrypoint here is actually the execution of the git-dumper command
 			Cmd: []string{"git-dumper", input, "/home/gget"},
 		},
 		&container.HostConfig{
