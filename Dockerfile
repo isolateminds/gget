@@ -1,4 +1,3 @@
 FROM python
-RUN mkdir /git
-WORKDIR /git
-RUN pip install git-dumper
+RUN  useradd -ms /bin/bash gget && pip3 install --upgrade pip && pip3 install git-dumper
+USER gget

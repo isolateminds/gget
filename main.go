@@ -1,234 +1,249 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"errors"
-	"embed"
+	_ "embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"syscall"
 
 	"github.com/docker/distribution/uuid"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/ttacon/chalk"
 )
 
 //go:embed Dockerfile.tar.gz
-var f embed.FS
+var tarFile []byte
+var input, output string
+var URLRegex = `https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*)`
 
-// Write json response to stdout
-type ErrorDetail struct {
-	Message string `json:"message"`
-}
-type Aux struct {
-	ID string `json:"ID"`
-}
-type DockerJSONWriter struct {
-	Stream string `json:"stream"`
-	Aux    Aux    `json:"aux"`
+func main() {
+	flag.StringVar(&input, "u", "", "git URL to download.")
+	flag.StringVar(&output, "o", "", "output directory")
+	flag.Parse()
+	HandleInput(&input)
+	HandleOutput(&output)
 
-	ErrorDetail ErrorDetail `json:"errorDetail"`
-}
-
-func (d *DockerJSONWriter) TagExists(tag string) bool {
-	return strings.Trim(tag, "\n") != ""
-}
-func (d *DockerJSONWriter) Print(phase string, r io.ReadCloser) error {
-
-	j := json.NewDecoder(r)
-	for err := j.Decode(d); err != io.EOF; err = j.Decode(d) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		LogFatal("%s", "Unable to create client")
+	}
+	go HandleSIGTERM(func() {
+		//Upon SIGTERM delete output dir and cancel context
+		cancel()
+		err := os.RemoveAll(output)
 		if err != nil {
-			return err
+			LogFatal("%s", "Unable to remove output directory.")
 		}
+	})
 
-		switch phase {
-		case "BUILD":
-			if d.TagExists(d.Stream) {
-				fmt.Printf("<%s> <%s> %s\n", chalk.Green.Color(phase), chalk.Yellow.Color("stream"), chalk.White.Color(d.Stream))
-			}
-			if d.TagExists(d.Aux.ID) {
-				fmt.Printf("<%s> <%s> %s\n", chalk.Green.Color(phase), chalk.Yellow.Color("aux"), chalk.White.Color(d.Aux.ID))
-			}
-			if d.TagExists(d.ErrorDetail.Message) {
-				fmt.Printf("<%s> <%s> %s\n", chalk.Red.Color(phase), chalk.Red.Color("error"), chalk.Underline.TextStyle(chalk.Red.Color(d.ErrorDetail.Message)))
-			}
-		}
+	BuildImage(ctx, client)
+	RunContainerThenRemove(ctx, client, CreateContainer(ctx, client))
+}
+
+//An object that implements io.Writer for git dumper log
+type GitDumperLog struct {
+	URLRegex *regexp.Regexp
+}
+
+func (g *GitDumperLog) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), "Fetching") {
+		fmt.Println(chalk.White.Color("(FETCHING)"), chalk.Green.Color(string(g.URLRegex.Find(p))))
+	} else if strings.Contains(string(p), "Testing") {
+		fmt.Println(chalk.White.Color("(TESTING)"), chalk.Yellow.Color(string(g.URLRegex.Find(p))))
+	} else {
+		fmt.Println(chalk.White.Color(string(p)))
 	}
-	return nil
+	return len(p), nil
 }
 
-type DockerImage struct {
-	ID          string
-	SourceDir 	string
-	URL 		string
-	ContextRoot context.Context
-	Client      *client.Client
-	JSON        *DockerJSONWriter
-}
+//Runs a  created container by the given id then removes
+func RunContainerThenRemove(ctxroot context.Context, client *client.Client, id string) {
 
-func (di *DockerImage) CreateContainer(ctxroot context.Context, chID chan string) error {
-	defer close(chID)
-	body, err := di.Client.ContainerCreate(
-		ctxroot,
-		&container.Config{
-			Image:        di.ID,
-			AttachStdout: true,
-			AttachStderr: true,
-			Entrypoint:   []string{"git-dumper", di.URL, "/git"},
-		},
-		&container.HostConfig{
-			Mounts: []mount.Mount{
-				{
-					Type:   mount.TypeBind,
-					Source: di.SourceDir,
-					Target: "/git",
-				},
-			},
-		},
-		&network.NetworkingConfig{},
-		&v1.Platform{
-			OS: "linux",
-		},
-		//random uuid string for docker container name
-		uuid.Generate().String(),
-	)
-
-
+	err := client.ContainerStart(ctxroot, id, types.ContainerStartOptions{})
 	if err != nil {
-		return err
+		LogFatal("%s", "Unable to start container", id, err)
 	}
-
-	chID <- body.ID
-	return nil
-}
-func (di *DockerImage) RunContainer(ctxroot context.Context, id string) error {
-	fmt.Printf("<%s> <%s> %s\n", chalk.Green.Color("RUN"), chalk.Yellow.Color("ID"), chalk.White.Color("Running container "+id))
-
-	err := di.Client.ContainerStart(ctxroot, id, types.ContainerStartOptions{})
-	if err != nil {
-		return err
-	}
-	rc, err := di.Client.ContainerLogs(ctxroot, id, types.ContainerLogsOptions{
+	rc, err := client.ContainerLogs(ctxroot, id, types.ContainerLogsOptions{
 		Follow:     true,
 		ShowStdout: true,
 		ShowStderr: true,
 	})
 	if err != nil {
-		return err
+		LogFatal("%s", "Unable to follow container log output", err)
 	}
-	io.Copy(os.Stdout, rc)
-	di.Client.ContainerRemove(ctxroot, id, types.ContainerRemoveOptions{
+	gdl := GitDumperLog{
+		URLRegex: regexp.MustCompile(URLRegex),
+	}
+	io.Copy(&gdl, rc)
+
+	client.ContainerRemove(ctxroot, id, types.ContainerRemoveOptions{
 		RemoveVolumes: true,
 		Force:         true,
 	})
 
 	if err != nil {
-		return err
+		LogFatal("%s", "Unable to remove container", id, err)
 	}
-	return nil
 }
 
-// builds from embedded dockerfile
-func NewDockerImage(ctxroot context.Context, url string, sourcedir string) (*DockerImage, error) {
-	client, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		log.Fatal(err)
-	}
-	data, err := f.Open("Dockerfile.tar.gz")
+//Creates a contianer for gget to use
+func CreateContainer(ctx context.Context, client *client.Client) (containerID string) {
+	body, err := client.ContainerCreate(
+		ctx,
+		&container.Config{
+			Image:        "gget",
+			AttachStdout: true,
+			AttachStderr: true,
+			User:         "gget",
+			//The entrypoint here is actually the invocation of the git-dumper command
+			Cmd: []string{"git-dumper", input, "/home/gget"},
+		},
+		&container.HostConfig{
+			Mounts: []mount.Mount{
+				{
+					Type:   mount.TypeBind,
+					Source: output,
+					Target: "/home/gget",
+				},
+			},
+		},
+		nil,
+		nil,
+		//random uuid string for docker container name
+		uuid.Generate().String(),
+	)
 
 	if err != nil {
-		return nil, err
+		LogFatal("%s", "Unable to create a container", err)
 	}
-
-	img := DockerImage{
-		Client: client,
-		ContextRoot: ctxroot,
-		JSON: &DockerJSONWriter{},
-		URL: url,
-		SourceDir: sourcedir,
-	 }
-
-	resp, err := client.ImageBuild(ctxroot, data, types.ImageBuildOptions{SuppressOutput: false})
-	if err != nil {
-		return nil, err
-	}
-	err = img.JSON.Print("BUILD", resp.Body)
-	img.ID = strings.Split(img.JSON.Aux.ID, ":")[1]
-	if err != nil {
-		return nil, err
-	}
-	return &img, nil
+	return body.ID
 }
 
-func ConfigureFlags(url *string, output *string){
-	if *url == "" {
-		log.Fatal(errors.New("output directory must be specified"))
-	}
+//ImagePullResponse represents the output from docker's image build response.
+//that implements io.Writer
+type ImageBuildResponse struct {
+	Stream      string      `json:"stream"`
+	Status      string      `json:"status"`
+	Progress    string      `json:"progress"`
+	Aux         Aux         `json:"aux"`
+	ErrorDetail ErrorDetail `json:"errorDetail"`
+	Error       string      `json:"error"`
+}
+type Aux struct {
+	ID string `json:"id"`
+}
+type ErrorDetail struct {
+	Message string `json:"message"`
+}
 
-	if *output == "" {
-		log.Fatal(errors.New("output directory must be specified"))
+func (ib *ImageBuildResponse) Write(p []byte) (int, error) {
+	jd := json.NewDecoder(bytes.NewReader(p))
+	err := jd.Decode(&ib)
+	if ib.Error != "" {
+		LogFatal("%s", ib.ErrorDetail.Message)
 	}
+	if ib.Stream != "" {
+		fmt.Println(chalk.White.Color("(STREAM)"))
+		fmt.Println(chalk.Green.Color(ib.Stream))
+	}
+	if ib.Progress != "" {
+		fmt.Println(chalk.White.Color("(STATUS)"))
+		fmt.Println(chalk.Green.Color(ib.Status))
+	}
+	if ib.Status != "" {
+		fmt.Println(chalk.White.Color("(PROGRESS)"))
+		fmt.Println(chalk.Green.Color(ib.Progress))
+	}
+	return len(p), err
+}
 
-	if strings.Contains(*output, "~") {
-		if homeDir, err := os.UserHomeDir(); err != nil {
-			log.Fatal(err)
-		} else {
-			*output = strings.Replace(*output, "~", homeDir, 1)
+//Build an image from embedded tar file
+func BuildImage(ctx context.Context, client *client.Client) {
+	var ibr ImageBuildResponse
+	options := types.ImageBuildOptions{
+		Tags: []string{"gget"},
+	}
+	res, err := client.ImageBuild(ctx, bytes.NewReader(tarFile), options)
+	if err != nil {
+		LogFatal("%s", "Unable to build image", err)
+	}
+	//Discard written bytes
+	_, err = io.Copy(&ibr, res.Body)
+	if err != nil {
+		LogFatal("%s", "Unable to build copy build response", err)
+	}
+}
+
+//handles the input URL
+func HandleInput(input *string) {
+	if input == nil || *input == "" {
+		LogFatal("%s", errors.New("The URL must be specified -u URL"))
+	}
+}
+
+//Handles the creation of the output directory
+func HandleOutput(output *string) {
+	if output == nil || *output == "" {
+		LogFatal("%s", errors.New("The output directory must be specified -o DIR"))
+	}
+	// if output begins with the tilde ~
+	// get the users home directory
+	s := *output
+	if string(s[0]) == "~" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			LogFatal("%s", err, output)
 		}
+		*output = strings.Replace(*output, "~", home, 1)
 	}
 	if !path.IsAbs(*output) {
-		if absp, err := filepath.Abs(*output); err != nil {
-			log.Fatal(err)
+		if abs, err := filepath.Abs(*output); err != nil {
+			LogFatal("%s", err, output)
 		} else {
-			fmt.Println(absp)
-			*output = absp
+			*output = abs
 		}
 	}
 	err := os.MkdirAll(*output, os.ModePerm)
 	if err != nil {
-		log.Fatal(err)
+		LogFatal("%s", err, output)
 	}
 
 }
 
-func main() {
-	var (
-		output string
-		url    string
-	)
-	flag.StringVar(&output, "o", "", "-o \"Some Output Directory\"")
-	flag.StringVar(&url, "u", "", "-u \"Some .git URL\"")
-	flag.Parse()
-	ConfigureFlags(&url, &output)
+//Starts a channel listening for SIGTERM Ctrl+C and invokes the callback
+func HandleSIGTERM(cb func()) {
+	//cleanup func upon Ctrl+C SIGINT or SIGTERM
+	c := make(chan os.Signal)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		cb()
+		os.Exit(1)
+	}()
+}
 
-	ctxroot := context.Background()
-	chID := make(chan string, 1)
-	img, err := NewDockerImage(ctxroot, url, output)
-
-	if err != nil {
-		log.Fatal(err)
+//Prints and exits
+func LogFatal(spec string, v ...any) {
+	var format string
+	for i := 0; i < len(v); i++ {
+		format += (spec + " ")
 	}
-
-	err = img.CreateContainer(ctxroot, chID)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-	id := <-chID
-	err = img.RunContainer(ctxroot, id)
-
-	if err != nil {
-		log.Fatal(err)
-	}
+	output := fmt.Sprintf(format, v...)
+	log.Fatal(chalk.White.Color("(ERROR) "), chalk.Red.Color(output))
 }
