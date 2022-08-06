@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	_ "embed"
@@ -10,15 +11,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 
-	"github.com/docker/distribution/uuid"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
@@ -28,14 +30,16 @@ import (
 
 //go:embed Dockerfile.tar.gz
 var tarFile []byte
-var input, output string
+var input, output, inputFilePath string
+var inputFile *os.File
 var URLRegex = `https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*)`
 
 func main() {
 	flag.StringVar(&input, "u", "", "git URL to download.")
 	flag.StringVar(&output, "o", "", "output directory")
+	flag.StringVar(&inputFilePath, "f", "", "A file of git url(s) seperated by new lines")
 	flag.Parse()
-	HandleInput(&input)
+	HandleInput(&input, &inputFilePath)
 	HandleOutput(&output)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -53,7 +57,25 @@ func main() {
 	})
 
 	BuildImage(ctx, client)
-	RunContainerThenRemove(ctx, client, CreateContainer(ctx, client))
+	if inputFile != nil {
+		var wg sync.WaitGroup
+		urls := make([]string, 0)
+		scanner := bufio.NewScanner(inputFile)
+		for scanner.Scan() {
+			urls = append(urls, scanner.Text())
+		}
+		wg.Add(len(urls))
+		for i := range urls {
+			go func(input string) {
+				RunContainerThenRemove(ctx, client, CreateContainer(ctx, client, input))
+				wg.Done()
+			}(urls[i])
+		}
+		wg.Wait()
+		inputFile.Close()
+	} else {
+		RunContainerThenRemove(ctx, client, CreateContainer(ctx, client, input))
+	}
 }
 
 //An object that implements io.Writer for git dumper log
@@ -103,7 +125,12 @@ func RunContainerThenRemove(ctxroot context.Context, client *client.Client, id s
 }
 
 //Creates a contianer for gget to use
-func CreateContainer(ctx context.Context, client *client.Client) (containerID string) {
+func CreateContainer(ctx context.Context, client *client.Client, gitUrl string) (containerID string) {
+	url, err := url.Parse(gitUrl)
+	if err != nil {
+		LogFatal("%s", "Unable to parse git URL ", err)
+	}
+	hostname := strings.ReplaceAll(url.Hostname(), ".", "_")
 	body, err := client.ContainerCreate(
 		ctx,
 		&container.Config{
@@ -112,7 +139,7 @@ func CreateContainer(ctx context.Context, client *client.Client) (containerID st
 			AttachStderr: true,
 			User:         "gget",
 			//The entrypoint here is actually the execution of the git-dumper command
-			Cmd: []string{"git-dumper", input, "/home/gget"},
+			Cmd: []string{"git-dumper", gitUrl, fmt.Sprintf("/home/gget/%s", hostname)},
 		},
 		&container.HostConfig{
 			Mounts: []mount.Mount{
@@ -125,8 +152,7 @@ func CreateContainer(ctx context.Context, client *client.Client) (containerID st
 		},
 		nil,
 		nil,
-		//random uuid string for docker container name
-		uuid.Generate().String(),
+		hostname,
 	)
 
 	if err != nil {
@@ -190,9 +216,16 @@ func BuildImage(ctx context.Context, client *client.Client) {
 	}
 }
 
-//handles the input URL
-func HandleInput(input *string) {
-	if input == nil || *input == "" {
+//Handles the input URL or file input
+func HandleInput(input *string, inputFilePath *string) {
+	if inputFilePath != nil && *inputFilePath != "" {
+		f, err := os.Open(*inputFilePath)
+
+		if err != nil {
+			LogFatal("%s", "Input File specified but an error occured", err)
+		}
+		inputFile = f
+	} else if input == nil || *input == "" {
 		LogFatal("%s", errors.New("The URL must be specified -u URL"))
 	}
 }
