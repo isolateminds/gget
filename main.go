@@ -28,7 +28,7 @@ import (
 	"github.com/ttacon/chalk"
 )
 
-//go:embed Dockerfile.tar.gz
+//go:embed Dockerfile.tar
 var tarFile []byte
 var input, output, inputFilePath string
 var inputFile *os.File
