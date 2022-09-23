@@ -21,7 +21,7 @@ OR build the program
 The build does embed a Tarfile into the program so any changes to the Dockerfile you should run
 
 ```bash
-$ tar -cvf Dockerfile.tar.gz Dockerfile
+$ tar -cvf Dockerfile.tar Dockerfile
 ```
 
 This is because the docker SDK expects a tarfile because just using a regular Dockerfile you get an EOF error
