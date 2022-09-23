@@ -1,4 +1,4 @@
-module github.com/dannyvidal/gget
+module github.com/isolateminds/gget
 
 go 1.18
 
